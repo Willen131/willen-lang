@@ -1,0 +1,33 @@
+# 编译产物
+*.exe
+*.o
+*.obj
+build/
+bin/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 性能测试临时输出
+bench/*.tmp
+bench/results/*.csv
+
+# Office 临时锁文件
+~$*
+
+# ---- 以下为开发过程材料，本地保留但不纳入仓库 ----
+
+# 开发计划与设计过程文档
+docs/superpowers/
+Willen语言项目执行计划书.docx
+tools/
+
+# 开发辅助工作区
+.superpowers/
