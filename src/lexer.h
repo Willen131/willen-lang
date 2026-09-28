@@ -28,5 +28,14 @@ private:
     Token makeToken(Tok type, const std::string& text, int line, int col) const;
     Token identOrKeyword();
     Token number();
+
+    // 解析字符串字面量。含插值的返回 isTemplate = true 且填好 parts，
+    // 否则返回普通 STR_LIT。
+    Token stringLiteral();
+
+    // 校验源码是否为合法 UTF-8。返回首个非法字节所在行号，全合法返回 0。
+    // 用于识别被存成 GBK 的源文件——否则中文关键字会静默失效。
+    int validateUtf8() const;
+
     void error(const std::string& message, int line);
 };

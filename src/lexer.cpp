@@ -89,6 +89,30 @@ void Lexer::error(const std::string& message, int line) {
     hadError_ = true;
 }
 
+int Lexer::validateUtf8() const {
+    size_t i = 0;
+    int line = 1;
+    while (i < src_.size()) {
+        unsigned char c = static_cast<unsigned char>(src_[i]);
+        if (c == '\n') { line++; i++; continue; }
+        if (c < 0x80) { i++; continue; }
+
+        int len;
+        if ((c & 0xE0) == 0xC0)      len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        else return line;            // 续字节或非法首字节
+
+        if (i + len > src_.size()) return line;
+        for (int k = 1; k < len; k++) {
+            unsigned char cc = static_cast<unsigned char>(src_[i + k]);
+            if ((cc & 0xC0) != 0x80) return line;
+        }
+        i += len;
+    }
+    return 0;
+}
+
 void Lexer::skipWhitespaceAndComments() {
     for (;;) {
         char c = peek();
@@ -132,8 +156,119 @@ Token Lexer::number() {
     return makeToken(isFloat ? Tok::FLOAT_LIT : Tok::INT_LIT, text, line, col);
 }
 
+Token Lexer::stringLiteral() {
+    int line = line_, col = col_;
+    advance();  // 开引号
+
+    std::string cur;                       // 正在累积的文本片段
+    std::vector<TemplatePart> parts;
+    bool hasExpr = false;
+
+    while (!atEnd() && peek() != '"') {
+        char c = peek();
+
+        if (c == '\n') {
+            error("字符串未闭合", line);
+            return makeToken(Tok::STR_LIT, cur, line, col);
+        }
+
+        if (c == '\\') {
+            advance();
+            if (atEnd()) break;
+            char e = advance();
+            switch (e) {
+                case 'n':  cur += '\n'; break;
+                case 't':  cur += '\t'; break;
+                case 'r':  cur += '\r'; break;
+                case '"':  cur += '"';  break;
+                case '\\': cur += '\\'; break;
+                case '{':  cur += '{';  break;
+                case '}':  cur += '}';  break;
+                default:
+                    error(std::string("无法识别的转义序列 '\\") + e + "'", line);
+                    cur += e;
+                    break;
+            }
+            continue;
+        }
+
+        if (c == '{') {
+            // "{{" 折叠为一个字面花括号
+            if (peek(1) == '{') {
+                advance();
+                advance();
+                cur += '{';
+                continue;
+            }
+            // 开始一段插值表达式：先收束前面的文本片段
+            advance();  // '{'
+            parts.push_back({false, cur});
+            cur.clear();
+
+            std::string expr;
+            int depth = 0;
+            bool closed = false;
+            while (!atEnd()) {
+                char e = peek();
+                if (e == '\n') break;
+                if (depth == 0 && e == '}') { closed = true; break; }
+                if (e == '(' || e == '[' || e == '{') depth++;
+                if (e == ')' || e == ']' || e == '}') depth--;
+                expr += advance();
+            }
+            if (!closed) {
+                error("模板插值表达式未闭合", line);
+                return makeToken(Tok::STR_LIT, cur, line, col);
+            }
+            advance();  // '}'
+            parts.push_back({true, expr});
+            hasExpr = true;
+            continue;
+        }
+
+        if (c == '}') {
+            // "}}" 折叠为一个字面花括号
+            if (peek(1) == '}') {
+                advance();
+                advance();
+                cur += '}';
+                continue;
+            }
+            cur += advance();
+            continue;
+        }
+
+        cur += advance();
+    }
+
+    if (atEnd()) {
+        error("字符串未闭合", line);
+        return makeToken(Tok::STR_LIT, cur, line, col);
+    }
+    advance();  // 闭引号
+
+    Token tok = makeToken(Tok::STR_LIT, "", line, col);
+    if (hasExpr) {
+        parts.push_back({false, cur});
+        tok.isTemplate = true;
+        tok.parts = std::move(parts);
+    } else {
+        tok.text = cur;
+    }
+    return tok;
+}
+
 std::vector<Token> Lexer::tokenize() {
     std::vector<Token> tokens;
+
+    // 源文件整体校验：被存成 GBK 的文件在这里被拦下，
+    // 否则中文关键字会静默失效，报出一堆莫名其妙的词法错误。
+    int badLine = validateUtf8();
+    if (badLine != 0) {
+        error("源文件编码不是 UTF-8，请以 UTF-8 无 BOM 格式保存", badLine);
+        tokens.push_back(makeToken(Tok::END, "", line_, col_));
+        return tokens;
+    }
 
     // 跳过 UTF-8 BOM。带 BOM 的文件若不处理，首个关键字会被识别成
     // 一个以 BOM 开头的标识符。
@@ -159,14 +294,72 @@ std::vector<Token> Lexer::tokenize() {
             tokens.push_back(number());
             continue;
         }
+        if (c == '"') {
+            tokens.push_back(stringLiteral());
+            continue;
+        }
 
         advance();
         switch (c) {
-            case '=': tokens.push_back(makeToken(Tok::ASSIGN, "=", line, col)); break;
+            case '=':
+                tokens.push_back(match('=')
+                    ? makeToken(Tok::EQ, "==", line, col)
+                    : makeToken(Tok::ASSIGN, "=", line, col));
+                break;
+            case '+':
+                tokens.push_back(match('=')
+                    ? makeToken(Tok::PLUS_ASSIGN, "+=", line, col)
+                    : makeToken(Tok::PLUS, "+", line, col));
+                break;
+            case '-':
+                tokens.push_back(match('=')
+                    ? makeToken(Tok::MINUS_ASSIGN, "-=", line, col)
+                    : makeToken(Tok::MINUS, "-", line, col));
+                break;
+            case '*':
+                tokens.push_back(match('=')
+                    ? makeToken(Tok::STAR_ASSIGN, "*=", line, col)
+                    : makeToken(Tok::STAR, "*", line, col));
+                break;
+            case '/':
+                tokens.push_back(match('=')
+                    ? makeToken(Tok::SLASH_ASSIGN, "/=", line, col)
+                    : makeToken(Tok::SLASH, "/", line, col));
+                break;
+            case '%':
+                tokens.push_back(makeToken(Tok::PERCENT, "%", line, col));
+                break;
+            case '!':
+                if (match('=')) {
+                    tokens.push_back(makeToken(Tok::NEQ, "!=", line, col));
+                } else {
+                    error("无法识别的字符 '!'（Willen 的逻辑非写作「非」）", line);
+                }
+                break;
+            case '<':
+                tokens.push_back(match('=')
+                    ? makeToken(Tok::LE, "<=", line, col)
+                    : makeToken(Tok::LT, "<", line, col));
+                break;
+            case '>':
+                tokens.push_back(match('=')
+                    ? makeToken(Tok::GE, ">=", line, col)
+                    : makeToken(Tok::GT, ">", line, col));
+                break;
+            case '.':
+                tokens.push_back(match('.')
+                    ? makeToken(Tok::DOTDOT, "..", line, col)
+                    : makeToken(Tok::DOT, ".", line, col));
+                break;
             case '(': tokens.push_back(makeToken(Tok::LPAREN, "(", line, col)); break;
             case ')': tokens.push_back(makeToken(Tok::RPAREN, ")", line, col)); break;
             case '{': tokens.push_back(makeToken(Tok::LBRACE, "{", line, col)); break;
             case '}': tokens.push_back(makeToken(Tok::RBRACE, "}", line, col)); break;
+            case '[': tokens.push_back(makeToken(Tok::LBRACKET, "[", line, col)); break;
+            case ']': tokens.push_back(makeToken(Tok::RBRACKET, "]", line, col)); break;
+            case ',': tokens.push_back(makeToken(Tok::COMMA, ",", line, col)); break;
+            case ';': tokens.push_back(makeToken(Tok::SEMICOLON, ";", line, col)); break;
+            case ':': tokens.push_back(makeToken(Tok::COLON, ":", line, col)); break;
             default:
                 error(std::string("无法识别的字符 '") + c + "'", line);
                 break;

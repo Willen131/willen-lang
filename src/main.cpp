@@ -15,7 +15,24 @@ static bool readFile(const std::string& path, std::string& out) {
     return true;
 }
 
+// 把字符串内容转义回可见形式，避免真实换行/制表符破坏逐行输出格式。
+static std::string escapeForDisplay(const std::string& s) {
+    std::string out;
+    for (char ch : s) {
+        switch (ch) {
+            case '\n': out += "\\n";  break;
+            case '\t': out += "\\t";  break;
+            case '\r': out += "\\r";  break;
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            default:   out += ch;     break;
+        }
+    }
+    return out;
+}
+
 // willen lex <文件> —— 打印词法单元序列，供词法器调试与测试比对。
+// 模板字符串显示为 TEMPLATE，其中文本片段原样输出、插值片段用 [[...]] 标出。
 static int cmdLex(const std::string& path) {
     std::string src;
     if (!readFile(path, src)) {
@@ -25,10 +42,23 @@ static int cmdLex(const std::string& path) {
     Lexer lex(src, path);
     std::vector<Token> tokens = lex.tokenize();
     for (const Token& t : tokens) {
-        std::cout << t.line << " " << tokName(t.type);
-        if (t.type == Tok::IDENT || t.type == Tok::INT_LIT ||
-            t.type == Tok::FLOAT_LIT) {
-            std::cout << " " << t.text;
+        std::cout << t.line << " ";
+        if (t.type == Tok::STR_LIT) {
+            if (t.isTemplate) {
+                std::cout << "TEMPLATE ";
+                for (const TemplatePart& p : t.parts) {
+                    if (p.isExpr) std::cout << "[[" << p.text << "]]";
+                    else          std::cout << escapeForDisplay(p.text);
+                }
+            } else {
+                std::cout << "STR_LIT " << escapeForDisplay(t.text);
+            }
+        } else {
+            std::cout << tokName(t.type);
+            if (t.type == Tok::IDENT || t.type == Tok::INT_LIT ||
+                t.type == Tok::FLOAT_LIT) {
+                std::cout << " " << t.text;
+            }
         }
         std::cout << "\n";
     }
