@@ -207,17 +207,45 @@ Token Lexer::stringLiteral() {
 
             std::string expr;
             int depth = 0;
+            bool inString = false;
             bool closed = false;
             while (!atEnd()) {
                 char e = peek();
                 if (e == '\n') break;
-                if (depth == 0 && e == '}') { closed = true; break; }
-                if (e == '(' || e == '[' || e == '{') depth++;
-                if (e == ')' || e == ']' || e == '}') depth--;
+
+                // 转义序列整体跳过，否则 \" 会被误当成字符串的结束引号
+                if (e == '\\') {
+                    expr += advance();
+                    if (!atEnd()) expr += advance();
+                    continue;
+                }
+                if (e == '"') {
+                    inString = !inString;
+                    expr += advance();
+                    continue;
+                }
+                // 只在字符串之外配对括号，这样 { 求值("}") } 里的 } 不会提前截断插值
+                if (!inString) {
+                    if (depth == 0 && e == '}') { closed = true; break; }
+                    if (e == '(' || e == '[' || e == '{') depth++;
+                    else if (e == ')' || e == ']' || e == '}') depth--;
+                }
                 expr += advance();
             }
             if (!closed) {
-                error("模板插值表达式未闭合", line);
+                error("模板插值表达式未闭合。字符串中的字面花括号请写成「{{」，"
+                      "插值表达式请写成「{表达式}」", line);
+                return makeToken(Tok::STR_LIT, cur, line, col);
+            }
+            // 空插值若放行，错误会推迟到语法分析阶段才暴露，
+            // 且报错位置指向模板内部而非这里，使用者难以定位。
+            if (expr.empty()) {
+                error("模板插值表达式不能为空，字符串中的字面花括号请写成「{{」", line);
+                advance();  // 消耗 '}'
+                // 报错后把字符串剩余部分吞掉。否则 '}' 与闭引号会被主循环
+                // 当成独立词法单元，产出一串无意义的 RBRACE 与空字符串。
+                while (!atEnd() && peek() != '"' && peek() != '\n') advance();
+                if (!atEnd() && peek() == '"') advance();
                 return makeToken(Tok::STR_LIT, cur, line, col);
             }
             advance();  // '}'

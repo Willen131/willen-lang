@@ -31,8 +31,28 @@ static std::string escapeForDisplay(const std::string& s) {
     return out;
 }
 
+// 模板文本片段的转义。比普通字符串多转义花括号——因为插值片段用 { } 标记，
+// 文本里若出现未转义的 { } 就会与插值标记混淆，使输出无法反推原始结构。
+static std::string escapeForTemplateText(const std::string& s) {
+    std::string out;
+    for (char ch : s) {
+        switch (ch) {
+            case '\n': out += "\\n";  break;
+            case '\t': out += "\\t";  break;
+            case '\r': out += "\\r";  break;
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '{':  out += "\\{";  break;
+            case '}':  out += "\\}";  break;
+            default:   out += ch;     break;
+        }
+    }
+    return out;
+}
+
 // willen lex <文件> —— 打印词法单元序列，供词法器调试与测试比对。
-// 模板字符串显示为 TEMPLATE，其中文本片段原样输出、插值片段用 [[...]] 标出。
+// 模板字符串显示为 TEMPLATE：插值片段用 { } 标出，文本片段中的花括号转义为 \{ \}。
+// 这样输出与源码一一对应且零歧义——文本片段里出现 [ ] 不会被误认成插值标记。
 static int cmdLex(const std::string& path) {
     std::string src;
     if (!readFile(path, src)) {
@@ -47,8 +67,8 @@ static int cmdLex(const std::string& path) {
             if (t.isTemplate) {
                 std::cout << "TEMPLATE ";
                 for (const TemplatePart& p : t.parts) {
-                    if (p.isExpr) std::cout << "[[" << p.text << "]]";
-                    else          std::cout << escapeForDisplay(p.text);
+                    if (p.isExpr) std::cout << "{" << p.text << "}";
+                    else          std::cout << escapeForTemplateText(p.text);
                 }
             } else {
                 std::cout << "STR_LIT " << escapeForDisplay(t.text);
