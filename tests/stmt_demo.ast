@@ -1,0 +1,8 @@
+(ConstDecl 圆周率 3.14)
+(StructDecl 点 (横 纵))
+(FuncDecl 求和 (甲 乙) (Block (VarDecl 结果 (+ 甲 乙)) (Return 结果)))
+(VarDecl 计数 0)
+(While (< 计数 3) (Block (Expr (= 计数 (+ 计数 1))) (If (== 计数 2) (Block (Continue)) (If (== 计数 3) (Block (Break)) (Block (Expr (Call 打印 计数)))))))
+(ForEach 元 (.. 0 2) (Block (Expr (Call 打印 元))))
+(Repeat 2 (Block (Expr (Call 打印 "嗨"))))
+(Block (VarDecl 局部 1))

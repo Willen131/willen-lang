@@ -150,6 +150,8 @@ std::string dumpStmt(const Stmt* s) {
     if (dynamic_cast<const BreakStmt*>(s))    return "(Break)";
     if (dynamic_cast<const ContinueStmt*>(s)) return "(Continue)";
     if (auto p = dynamic_cast<const ReturnStmt*>(s)) {
+        // 「返回」不带值也是合法的，此时不打印占位符
+        if (!p->value) return "(Return)";
         return "(Return " + dumpExpr(p->value.get()) + ")";
     }
     if (auto p = dynamic_cast<const FuncDecl*>(s)) {

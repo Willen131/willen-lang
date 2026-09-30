@@ -41,6 +41,19 @@ private:
 
     // ---- 语句 ----
     StmtPtr declaration();
+    StmtPtr structDecl();
+    StmtPtr funcDecl();
+    StmtPtr ifStatement();
+    StmtPtr ifTail(int line, ExprPtr cond);   // 「否则如果」链共用的尾部
+    StmtPtr whileStatement();
+    StmtPtr forEachStatement();
+    StmtPtr repeatStatement();
+    StmtPtr returnStatement();
+    StmtPtr block();
+
+    // 解析条件，括号强制。缺失括号时报错并跳过被误写的条件部分——
+    // 否则「甲 {」会被当成结构字面量，引发一串级联错误。
+    ExprPtr condition(const std::string& keyword, int line);
 
     // ---- 表达式（按优先级从低到高）----
     ExprPtr expression();
