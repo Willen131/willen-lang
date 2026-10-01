@@ -1,3 +1,4 @@
+#include "interp.h"
 #include "lexer.h"
 #include "parser.h"
 #include <fcntl.h>
@@ -107,6 +108,25 @@ static int cmdAst(const std::string& path) {
     return 0;
 }
 
+// willen run <文件> —— 执行脚本
+static int cmdRun(const std::string& path) {
+    std::string src;
+    if (!readFile(path, src)) {
+        std::cerr << "无法打开文件：" << path << "\n";
+        return 1;
+    }
+    Lexer lex(src, path);
+    std::vector<Token> tokens = lex.tokenize();
+    if (lex.hadError()) return 1;
+
+    Parser parser(std::move(tokens), path);
+    std::vector<StmtPtr> stmts = parser.parse();
+    if (parser.hadError()) return 1;
+
+    Interpreter interp;
+    return interp.run(stmts) ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -121,13 +141,15 @@ int main(int argc, char** argv) {
         std::cerr << "用法：willen <命令> <文件>\n"
                   << "命令：\n"
                   << "  lex <文件>   打印词法单元\n"
-                  << "  ast <文件>   打印语法树\n";
+                  << "  ast <文件>   打印语法树\n"
+                  << "  run <文件>   执行脚本\n";
         return 1;
     }
 
     std::string cmd = argv[1];
     if (cmd == "lex") return cmdLex(argv[2]);
     if (cmd == "ast") return cmdAst(argv[2]);
+    if (cmd == "run") return cmdRun(argv[2]);
 
     std::cerr << "未知命令：" << cmd << "\n";
     return 1;
