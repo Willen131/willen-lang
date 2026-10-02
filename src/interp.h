@@ -6,6 +6,10 @@
 #include <unordered_map>
 #include <vector>
 
+// 语句执行的控制流信号。
+// exec 返回它：循环语句据此决定继续下一轮、跳出、还是把 return 继续往上抛。
+enum class Flow { Normal, Break, Continue, Return };
+
 // 作用域。沿 parent 指针向上查找，构成词法作用域链。
 //
 // consts 记录哪些名字是常量：给常量重复赋值要报错。这个约束只能在
@@ -32,11 +36,20 @@ public:
     bool run(const std::vector<StmtPtr>& program);
 
 private:
+    // 递归深度上限。超过即报中文错误，而不是任由 C++ 调用栈溢出崩溃。
+    static constexpr int kMaxCallDepth = 200;
+
     Env globals_;
     Env* env_;                       // 当前作用域；顶层时指向 globals_
     std::unordered_map<std::string, std::shared_ptr<StructDef>> structDefs_;
 
+    // 函数表。Willen 不做闭包，函数一律定义在顶层，因此只需按名字索引。
+    std::unordered_map<std::string, const FuncDecl*> funcs_;
+    Value returnValue_;              // 函数返回值的传递通道
+    int callDepth_ = 0;
+
     Value eval(const Expr* e);
-    void exec(const Stmt* s);
+    Flow exec(const Stmt* s);
+    Value callFunction(const FuncDecl* fn, std::vector<Value>& args, int line);
     void assignTo(const Expr* target, const Value& value, int line);
 };
