@@ -5,6 +5,9 @@
 build/
 bin/
 
+# 构建用临时目录（见 build.sh 的说明）
+.build-tmp/
+
 # 编辑器
 .vscode/
 .idea/

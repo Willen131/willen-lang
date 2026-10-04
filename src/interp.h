@@ -32,8 +32,13 @@ class Interpreter {
 public:
     Interpreter();
 
-    // 返回是否正常跑完。出错时错误信息已打印到 stderr。
-    bool run(const std::vector<StmtPtr>& program);
+    // 参数按值接收：语法树由解释器接管并保活，理由见 programs_ 的注释。
+    bool run(std::vector<StmtPtr> program);
+
+    // 供 repl 使用：执行一批语句；若最后一条是表达式语句，
+    // 把它的值交给 out 并由 hasOut 标记。这样在交互界面里敲一个表达式
+    // 就能直接看到结果，不必每次套一层 打印(...)。
+    bool runRepl(std::vector<StmtPtr> stmts, Value& out, bool& hasOut);
 
 private:
     // 递归深度上限。超过即报中文错误，而不是任由 C++ 调用栈溢出崩溃。
@@ -47,6 +52,14 @@ private:
     std::unordered_map<std::string, const FuncDecl*> funcs_;
     Value returnValue_;              // 函数返回值的传递通道
     int callDepth_ = 0;
+
+    // 语法树保活。
+    //
+    // funcs_ 里存的是指向 FuncDecl 节点的裸指针，因此被登记过的语法树
+    // 必须在解释器存活期间一直有效。单次运行（willen run）不会有问题，
+    // 但 repl 每次输入都解析出一棵新树，若不接管所有权，函数表里的指针
+    // 会在下一行输入到来时悬空——表现为「定义了函数却调不到」。
+    std::vector<std::vector<StmtPtr>> programs_;
 
     Value eval(const Expr* e);
     Flow exec(const Stmt* s);

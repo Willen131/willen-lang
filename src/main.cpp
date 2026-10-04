@@ -108,6 +108,51 @@ static int cmdAst(const std::string& path) {
     return 0;
 }
 
+// willen repl —— 交互式解释器。变量与函数定义在整个会话内持续有效。
+static int cmdRepl() {
+    std::cout << "Willen 交互式解释器。输入 退出 结束，Ctrl+D 亦可。\n";
+
+    Interpreter interp;
+    std::string buffer, line;
+
+    for (;;) {
+        std::cout << (buffer.empty() ? "> " : "... ");
+        std::cout.flush();
+        if (!std::getline(std::cin, line)) break;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        if (buffer.empty() && (line == "退出" || line == "exit")) break;
+        if (line.empty() && buffer.empty()) continue;
+
+        buffer += line + "\n";
+
+        // 花括号没配平就继续读，这样函数与循环可以跨行输入
+        int depth = 0;
+        for (char c : buffer) {
+            if (c == '{') depth++;
+            else if (c == '}') depth--;
+        }
+        if (depth > 0) continue;
+
+        Lexer lex(buffer, "<repl>");
+        std::vector<Token> tokens = lex.tokenize();
+        if (lex.hadError()) { buffer.clear(); continue; }
+
+        Parser parser(std::move(tokens), "<repl>");
+        std::vector<StmtPtr> stmts = parser.parse();
+        if (parser.hadError()) { buffer.clear(); continue; }
+
+        Value out;
+        bool hasOut = false;
+        interp.runRepl(std::move(stmts), out, hasOut);
+        if (hasOut) std::cout << out.toString() << "\n";
+        buffer.clear();
+    }
+
+    std::cout << "\n";
+    return 0;
+}
+
 // willen run <文件> —— 执行脚本
 static int cmdRun(const std::string& path) {
     std::string src;
@@ -124,7 +169,7 @@ static int cmdRun(const std::string& path) {
     if (parser.hadError()) return 1;
 
     Interpreter interp;
-    return interp.run(stmts) ? 0 : 1;
+    return interp.run(std::move(stmts)) ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
@@ -137,16 +182,23 @@ int main(int argc, char** argv) {
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
 
-    if (argc < 3) {
-        std::cerr << "用法：willen <命令> <文件>\n"
+    if (argc < 2) {
+        std::cerr << "用法：willen <命令> [文件]\n"
                   << "命令：\n"
-                  << "  lex <文件>   打印词法单元\n"
-                  << "  ast <文件>   打印语法树\n"
-                  << "  run <文件>   执行脚本\n";
+                  << "  run  <文件>   执行脚本\n"
+                  << "  lex  <文件>   打印词法单元\n"
+                  << "  ast  <文件>   打印语法树\n"
+                  << "  repl          交互式解释器\n";
         return 1;
     }
 
     std::string cmd = argv[1];
+    if (cmd == "repl") return cmdRepl();
+
+    if (argc < 3) {
+        std::cerr << "命令 " << cmd << " 需要一个文件名\n";
+        return 1;
+    }
     if (cmd == "lex") return cmdLex(argv[2]);
     if (cmd == "ast") return cmdAst(argv[2]);
     if (cmd == "run") return cmdRun(argv[2]);
