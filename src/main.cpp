@@ -1,6 +1,9 @@
 #include "interp.h"
 #include "lexer.h"
 #include "parser.h"
+#include <algorithm>
+#include <clocale>
+#include <filesystem>
 #include <fcntl.h>
 #include <io.h>
 #include <fstream>
@@ -8,8 +11,75 @@
 #include <sstream>
 #include <windows.h>
 
+// ---- 路径编码转换 ----
+//
+// Windows 上窄字符路径是按系统 ANSI 编码（中文环境为 GBK）解释的，
+// 而本程序内部的路径字符串一律是 UTF-8；std::filesystem 在 C++17 下
+// 唯一的转换入口 u8path 又依赖当前 locale，默认 locale 下遇到非 ASCII
+// 会直接抛 "Illegal byte sequence"（实测 setlocale 也救不回来）。
+// 因此直接走 Windows API 做转换，行为完全可控。
+
+#ifdef _WIN32
+static std::wstring utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(),
+                                static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()),
+                        &w[0], n);
+    return w;
+}
+
+static std::string wideToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
+                                static_cast<int>(w.size()), nullptr, 0,
+                                nullptr, nullptr);
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                        &s[0], n, nullptr, nullptr);
+    return s;
+}
+#endif
+
+// Windows 把命令行参数按系统 ANSI 编码（中文环境是 GBK）传给 main，
+// 这里统一转成程序内部使用的 UTF-8。否则用户敲
+// `willen run examples/斐波那契.wl` 时，程序收到的是一串 GBK 字节。
+static std::string fromSystemEncoding(const std::string& s) {
+#ifdef _WIN32
+    if (s.empty()) return s;
+    int n = MultiByteToWideChar(CP_ACP, 0, s.c_str(),
+                                static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, s.c_str(), static_cast<int>(s.size()),
+                        &w[0], n);
+    return wideToUtf8(w);
+#else
+    return s;
+#endif
+}
+
+// UTF-8 路径字符串 → std::filesystem::path
+static std::filesystem::path toPath(const std::string& utf8) {
+#ifdef _WIN32
+    return std::filesystem::path(utf8ToWide(utf8));
+#else
+    return std::filesystem::path(utf8);
+#endif
+}
+
+// std::filesystem::path → UTF-8 路径字符串
+static std::string fromPath(const std::filesystem::path& p) {
+#ifdef _WIN32
+    return wideToUtf8(p.wstring());
+#else
+    return p.string();
+#endif
+}
+
+// 读取整个文件
 static bool readFile(const std::string& path, std::string& out) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(toPath(path), std::ios::binary);
     if (!f) return false;
     std::ostringstream ss;
     ss << f.rdbuf();
@@ -153,6 +223,139 @@ static int cmdRepl() {
     return 0;
 }
 
+// 解析并执行一段源码。供测试运行器按「测试库 + 测试脚本」两段调用。
+static bool runSource(Interpreter& interp, const std::string& src,
+                      const std::string& name) {
+    Lexer lex(src, name);
+    std::vector<Token> tokens = lex.tokenize();
+    if (lex.hadError()) return false;
+
+    Parser parser(std::move(tokens), name);
+    std::vector<StmtPtr> stmts = parser.parse();
+    if (parser.hadError()) return false;
+
+    return interp.run(std::move(stmts));
+}
+
+// 逐行比对，只报告第一处不同——测试失败时最需要知道的是「哪里开始不对」
+static void reportFirstDiff(const std::string& expected, const std::string& actual) {
+    std::vector<std::string> want, got;
+    std::string line;
+    std::istringstream es(expected), as(actual);
+    while (std::getline(es, line)) want.push_back(line);
+    while (std::getline(as, line)) got.push_back(line);
+
+    size_t n = std::max(want.size(), got.size());
+    for (size_t i = 0; i < n; i++) {
+        std::string w = i < want.size() ? want[i] : "(没有这一行)";
+        std::string g = i < got.size()  ? got[i]  : "(没有这一行)";
+        if (w != g) {
+            std::cout << "       第 " << (i + 1) << " 行不同\n"
+                      << "         期望：" << w << "\n"
+                      << "         实际：" << g << "\n";
+            return;
+        }
+    }
+}
+
+// willen test <目录> —— 黑盒测试运行器
+//
+// 扫描目录下的 .wl 文件（测试库除外），凡是配有同名 .expected 的，
+// 就先加载测试库、再执行测试脚本，把标准输出与期望逐字节比对。
+// 测试脚本与断言库全部用 Willen 语言编写，运行器只负责调度与比对。
+static int cmdTest(const std::string& dirArg) {
+    namespace fs = std::filesystem;
+    const std::string LIB = "测试库.wl";
+
+    // 去掉路径末尾的斜杠。否则「tests/」会拼出「tests//测试库.wl」这样的
+    // 双斜杠路径，在 Windows 上打不开文件。
+    std::string dir = dirArg;
+    while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
+    if (dir.empty()) dir = ".";
+
+    std::string libSrc;
+    if (!readFile(dir + "/" + LIB, libSrc)) {
+        std::cerr << "找不到测试库：" << dir << "/" << LIB << "\n";
+        return 1;
+    }
+
+    // 全程用 fs::path 对象做文件系统操作。
+    // 从 std::string 构造 path 会按 ANSI 编码解释，中文文件名会出错；
+    // 用 u8path 构造、用 u8string 取回，才能正确往返。
+    std::vector<fs::path> files;
+    int skipped = 0;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(toPath(dir), ec)) {
+        if (!entry.is_regular_file()) continue;
+
+        fs::path p = entry.path();
+        std::string name = fromPath(p.filename());
+        if (name.size() < 4 || name.compare(name.size() - 3, 3, ".wl") != 0) continue;
+        if (name == LIB) continue;
+
+        // 没有期望输出的 .wl 不是测试用例（可能是示例或数据），跳过
+        fs::path expectedPath = p;
+        expectedPath.replace_extension(".expected");
+        if (!fs::exists(expectedPath)) { skipped++; continue; }
+
+        files.push_back(p);
+    }
+    std::sort(files.begin(), files.end());
+
+    if (files.empty()) {
+        std::cout << "目录 " << dir
+                  << " 下没有测试用例（需要 .wl 与同名 .expected 配对）\n";
+        return 1;
+    }
+
+    int passed = 0, failed = 0;
+    for (const fs::path& p : files) {
+        std::string name = fromPath(p.filename());
+        std::string path = fromPath(p);
+
+        fs::path expectedPath = p;
+        expectedPath.replace_extension(".expected");
+
+        // 每个用例用全新的解释器，避免用例之间互相污染
+        Interpreter interp;
+
+        // 捕获脚本的标准输出；错误信息走 stderr，不受影响，能直接看到
+        std::ostringstream captured;
+        std::streambuf* savedBuf = std::cout.rdbuf(captured.rdbuf());
+
+        bool ok = runSource(interp, libSrc, dir + "/" + LIB);
+        if (ok) {
+            std::string src;
+            ok = readFile(path, src) && runSource(interp, src, path);
+        }
+
+        std::cout.rdbuf(savedBuf);
+
+        std::string actual = captured.str();
+        std::string expected;
+        readFile(fromPath(expectedPath), expected);
+
+        if (ok && actual == expected) {
+            passed++;
+            std::cout << "[通过] " << name << "\n";
+        } else {
+            failed++;
+            std::cout << "[失败] " << name << "\n";
+            if (!ok) std::cout << "       脚本执行出错，详见上方错误信息\n";
+            else reportFirstDiff(expected, actual);
+        }
+    }
+
+    std::cout << "--------------------------------\n";
+    std::cout << "共 " << files.size() << " 个测试文件，通过 " << passed
+              << "，失败 " << failed;
+    if (skipped > 0) {
+        std::cout << "（另有 " << skipped << " 个 .wl 无 .expected，已跳过）";
+    }
+    std::cout << "\n";
+    return failed == 0 ? 0 : 1;
+}
+
 // willen run <文件> —— 执行脚本
 static int cmdRun(const std::string& path) {
     std::string src;
@@ -173,6 +376,10 @@ static int cmdRun(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
+    // 命令行参数先转成 UTF-8，之后一律用 args 而非 argv
+    std::vector<std::string> args;
+    for (int i = 0; i < argc; i++) args.push_back(fromSystemEncoding(argv[i]));
+
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
@@ -188,20 +395,22 @@ int main(int argc, char** argv) {
                   << "  run  <文件>   执行脚本\n"
                   << "  lex  <文件>   打印词法单元\n"
                   << "  ast  <文件>   打印语法树\n"
+                  << "  test <目录>   运行黑盒测试集\n"
                   << "  repl          交互式解释器\n";
         return 1;
     }
 
-    std::string cmd = argv[1];
+    std::string cmd = args[1];
     if (cmd == "repl") return cmdRepl();
 
     if (argc < 3) {
         std::cerr << "命令 " << cmd << " 需要一个文件名\n";
         return 1;
     }
-    if (cmd == "lex") return cmdLex(argv[2]);
-    if (cmd == "ast") return cmdAst(argv[2]);
-    if (cmd == "run") return cmdRun(argv[2]);
+    if (cmd == "lex") return cmdLex(args[2]);
+    if (cmd == "ast") return cmdAst(args[2]);
+    if (cmd == "run") return cmdRun(args[2]);
+    if (cmd == "test") return cmdTest(args[2]);
 
     std::cerr << "未知命令：" << cmd << "\n";
     return 1;
