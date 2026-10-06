@@ -293,10 +293,12 @@ static int cmdTest(const std::string& dirArg) {
         if (name.size() < 4 || name.compare(name.size() - 3, 3, ".wl") != 0) continue;
         if (name == LIB) continue;
 
-        // 没有期望输出的 .wl 不是测试用例（可能是示例或数据），跳过
-        fs::path expectedPath = p;
-        expectedPath.replace_extension(".expected");
-        if (!fs::exists(expectedPath)) { skipped++; continue; }
+        // 既没有 .expected 也没有 .expected_err 的 .wl 不是测试用例
+        //（可能是示例或数据），跳过
+        fs::path okPath = p, errPath = p;
+        okPath.replace_extension(".expected");
+        errPath.replace_extension(".expected_err");
+        if (!fs::exists(okPath) && !fs::exists(errPath)) { skipped++; continue; }
 
         files.push_back(p);
     }
@@ -313,15 +315,17 @@ static int cmdTest(const std::string& dirArg) {
         std::string name = fromPath(p.filename());
         std::string path = fromPath(p);
 
-        fs::path expectedPath = p;
-        expectedPath.replace_extension(".expected");
+        fs::path okPath = p, errPath = p;
+        okPath.replace_extension(".expected");
+        errPath.replace_extension(".expected_err");
 
         // 每个用例用全新的解释器，避免用例之间互相污染
         Interpreter interp;
 
-        // 捕获脚本的标准输出；错误信息走 stderr，不受影响，能直接看到
-        std::ostringstream captured;
-        std::streambuf* savedBuf = std::cout.rdbuf(captured.rdbuf());
+        // 两个流都要捕获：正常用例比对 stdout，预期出错的用例比对 stderr
+        std::ostringstream capturedOut, capturedErr;
+        std::streambuf* savedOut = std::cout.rdbuf(capturedOut.rdbuf());
+        std::streambuf* savedErr = std::cerr.rdbuf(capturedErr.rdbuf());
 
         bool ok = runSource(interp, libSrc, dir + "/" + LIB);
         if (ok) {
@@ -329,20 +333,49 @@ static int cmdTest(const std::string& dirArg) {
             ok = readFile(path, src) && runSource(interp, src, path);
         }
 
-        std::cout.rdbuf(savedBuf);
+        std::cout.rdbuf(savedOut);
+        std::cerr.rdbuf(savedErr);
 
-        std::string actual = captured.str();
+        // ---- 预期出错的用例：脚本必须失败，且错误信息与期望一致 ----
+        // 这类用例用于验证运行时错误的中文提示，因此比对的是 stderr。
+        if (fs::exists(errPath)) {
+            std::string expectedErr;
+            readFile(fromPath(errPath), expectedErr);
+
+            if (!ok && capturedErr.str() == expectedErr) {
+                passed++;
+                std::cout << "[通过] " << name << "（预期出错）\n";
+            } else {
+                failed++;
+                std::cout << "[失败] " << name << "（预期出错）\n";
+                if (ok) {
+                    std::cout << "       脚本本应出错，却正常结束了\n";
+                } else {
+                    reportFirstDiff(expectedErr, capturedErr.str());
+                }
+            }
+            continue;
+        }
+
+        // ---- 正常用例：脚本必须成功，且输出与期望一致 ----
         std::string expected;
-        readFile(fromPath(expectedPath), expected);
+        readFile(fromPath(okPath), expected);
 
-        if (ok && actual == expected) {
+        if (ok && capturedOut.str() == expected) {
             passed++;
             std::cout << "[通过] " << name << "\n";
         } else {
             failed++;
             std::cout << "[失败] " << name << "\n";
-            if (!ok) std::cout << "       脚本执行出错，详见上方错误信息\n";
-            else reportFirstDiff(expected, actual);
+            if (!ok) {
+                std::string e = capturedErr.str();
+                while (!e.empty() && (e.back() == '\n' || e.back() == '\r')) {
+                    e.pop_back();
+                }
+                std::cout << "       脚本执行出错：" << e << "\n";
+            } else {
+                reportFirstDiff(expected, capturedOut.str());
+            }
         }
     }
 
