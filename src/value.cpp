@@ -1,4 +1,5 @@
 #include "value.h"
+#include <iomanip>
 #include <sstream>
 
 int StructDef::indexOf(const std::string& field) const {
@@ -68,9 +69,22 @@ std::string Value::toString() const {
 
     if (auto p = std::get_if<int64_t>(&v)) return std::to_string(*p);
     if (auto p = std::get_if<double>(&v)) {
+        // 用定点格式保留最多 6 位小数，再去掉末尾多余的 0 与小数点。
+        //
+        // 不能直接用 os << *p：流默认只保留 6 位**有效数字**，于是
+        //   78.53975  →  78.5397      （丢了精度）
+        //   1234567.0 →  1.23457e+06   （变成科学计数法）
+        // 两者都不符合使用者的直觉。定点格式则输出
+        //   78.53975  →  78.53975
+        //   1234567.0 →  1234567
         std::ostringstream os;
-        os << *p;
-        return os.str();
+        os << std::fixed << std::setprecision(6) << *p;
+        std::string s = os.str();
+
+        size_t last = s.find_last_not_of('0');
+        if (last != std::string::npos && s[last] == '.') last--;
+        s.erase(last + 1);
+        return s;
     }
     if (auto p = std::get_if<bool>(&v))        return *p ? "真" : "假";
     if (auto p = std::get_if<std::string>(&v)) return *p;
