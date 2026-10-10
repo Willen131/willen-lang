@@ -18,9 +18,8 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
-# 性能测试临时输出
+# 性能测试临时输出（results/ 里的测量结果要保留，是报告的数据来源）
 bench/*.tmp
-bench/results/*.csv
 
 # Office 临时锁文件
 ~$*
