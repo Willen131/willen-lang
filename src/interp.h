@@ -10,17 +10,18 @@
 // exec 返回它：循环语句据此决定继续下一轮、跳出、还是把 return 继续往上抛。
 enum class Flow { Normal, Break, Continue, Return };
 
-// 作用域。沿 parent 指针向上查找，构成词法作用域链。
+// 全局作用域。
 //
-// consts 记录哪些名字是常量：给常量重复赋值要报错。这个约束只能在
-// 运行期检查——解析期无法判定一次赋值落在哪个作用域里。
+// 引入槽位化之后，函数内的局部变量由 Resolver 在解析期绑定成下标，
+// 运行期直接按 vector 下标寻址，不再需要作用域链——因此这里只保存
+// 全局变量，也不再需要 parent 指针。
+//
+// consts 记录哪些名字是常量：给常量重复赋值要报错。
 struct Env {
     std::unordered_map<std::string, Value> vars;
     std::unordered_map<std::string, bool> consts;
-    Env* parent = nullptr;
 
-    Value* find(const std::string& name);
-    void define(const std::string& name, Value value, bool isConst);
+    bool isConst(const std::string& name) const { return consts.count(name) > 0; }
 };
 
 // 语法树求值器。
@@ -45,7 +46,11 @@ private:
     static constexpr int kMaxCallDepth = 200;
 
     Env globals_;
-    Env* env_;                       // 当前作用域；顶层时指向 globals_
+
+    // 当前函数帧的槽位。局部变量按 Resolver 分配的下标直接寻址，
+    // 省掉了原来每次访问都要做的字符串哈希。
+    std::vector<Value> slots_;
+
     std::unordered_map<std::string, std::shared_ptr<StructDef>> structDefs_;
 
     // 函数表。Willen 不做闭包，函数一律定义在顶层，因此只需按名字索引。

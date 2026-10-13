@@ -3,21 +3,6 @@
 #include <iostream>
 #include <string>
 
-// ---------------- 作用域 ----------------
-
-Value* Env::find(const std::string& name) {
-    for (Env* e = this; e; e = e->parent) {
-        auto it = e->vars.find(name);
-        if (it != e->vars.end()) return &it->second;
-    }
-    return nullptr;
-}
-
-void Env::define(const std::string& name, Value value, bool isConst) {
-    vars[name] = std::move(value);
-    if (isConst) consts[name] = true;
-}
-
 // ---------------- 运算辅助 ----------------
 
 static int compareValues(const Value& l, const Value& r, int line) {
@@ -102,7 +87,7 @@ static Value applyBinary(Tok op, const Value& l, const Value& r, int line) {
 
 // ---------------- 求值器 ----------------
 
-Interpreter::Interpreter() : env_(&globals_) {}
+Interpreter::Interpreter() {}
 
 bool Interpreter::run(std::vector<StmtPtr> program) {
     programs_.push_back(std::move(program));
@@ -146,180 +131,218 @@ bool Interpreter::runRepl(std::vector<StmtPtr> stmts, Value& out, bool& hasOut) 
 Value Interpreter::eval(const Expr* e) {
     if (!e) return Value{};
 
-    if (auto p = dynamic_cast<const IntLit*>(e))   return Value::makeInt(p->value);
-    if (auto p = dynamic_cast<const FloatLit*>(e)) return Value::makeFloat(p->value);
-    if (auto p = dynamic_cast<const StrLit*>(e))   return Value::makeStr(p->value);
-    if (auto p = dynamic_cast<const BoolLit*>(e))  return Value::makeBool(p->value);
-    if (dynamic_cast<const NullLit*>(e))           return Value{};
+    // 用 kind 做一次 switch 分发。
+    // 原先这里是一长串 dynamic_cast，每求值一个节点都要逐个尝试十几个
+    // 类型——dynamic_cast 要查运行时类型信息，比一次跳转慢得多。
+    // 改成 switch 后只剩一次跳转加一次 static_cast。
+    switch (e->kind) {
 
-    // 模板：片段在解析期就已降解好，这里只需把各片段拼起来
-    if (auto p = dynamic_cast<const TmplLit*>(e)) {
-        std::string out;
-        for (const ExprPtr& piece : p->pieces) out += eval(piece.get()).toString();
-        return Value::makeStr(out);
-    }
+        case ExprKind::Int:
+            return Value::makeInt(static_cast<const IntLit*>(e)->value);
+        case ExprKind::Float:
+            return Value::makeFloat(static_cast<const FloatLit*>(e)->value);
+        case ExprKind::Str:
+            return Value::makeStr(static_cast<const StrLit*>(e)->value);
+        case ExprKind::Bool:
+            return Value::makeBool(static_cast<const BoolLit*>(e)->value);
+        case ExprKind::Null:
+            return Value{};
 
-    if (auto p = dynamic_cast<const ArrayLit*>(e)) {
-        Value arr = Value::makeArray();
-        std::vector<Value>& items = *std::get<ArrayPtr>(arr.v);
-        for (const ExprPtr& item : p->items) items.push_back(eval(item.get()));
-        return arr;
-    }
-
-    if (auto p = dynamic_cast<const StructLit*>(e)) {
-        auto it = structDefs_.find(p->name);
-        if (it == structDefs_.end()) {
-            throw RuntimeError{"未定义的结构体「" + p->name + "」", e->line};
+        // 模板：片段在解析期就已降解好，这里只需把各片段拼起来
+        case ExprKind::Tmpl: {
+            auto p = static_cast<const TmplLit*>(e);
+            std::string out;
+            for (const ExprPtr& piece : p->pieces) out += eval(piece.get()).toString();
+            return Value::makeStr(out);
         }
-        std::shared_ptr<StructDef> def = it->second;
-        Value inst = Value::makeStruct(def);
-        std::vector<Value>& fields = std::get<StructPtr>(inst.v)->fields;
-        for (const auto& f : p->fields) {
-            int idx = def->indexOf(f.first);
-            if (idx < 0) {
-                throw RuntimeError{"结构体 " + p->name + " 没有字段 " + f.first,
-                                   e->line};
+
+        case ExprKind::Array: {
+            auto p = static_cast<const ArrayLit*>(e);
+            Value arr = Value::makeArray();
+            std::vector<Value>& items = *std::get<ArrayPtr>(arr.v);
+            for (const ExprPtr& item : p->items) items.push_back(eval(item.get()));
+            return arr;
+        }
+
+        case ExprKind::Struct: {
+            auto p = static_cast<const StructLit*>(e);
+            auto it = structDefs_.find(p->name);
+            if (it == structDefs_.end()) {
+                throw RuntimeError{"未定义的结构体「" + p->name + "」", e->line};
             }
-            fields[idx] = eval(f.second.get());
-        }
-        return inst;
-    }
-
-    if (auto p = dynamic_cast<const VarExpr*>(e)) {
-        Value* slot = env_->find(p->name);
-        if (!slot) throw RuntimeError{"未定义的变量「" + p->name + "」", e->line};
-        return *slot;
-    }
-
-    if (auto p = dynamic_cast<const RangeExpr*>(e)) {
-        Value from = eval(p->from.get());
-        Value to = eval(p->to.get());
-        if (!from.isInt() || !to.isInt()) {
-            throw RuntimeError{"范围的两端都必须是整数", e->line};
-        }
-        Value arr = Value::makeArray();
-        std::vector<Value>& items = *std::get<ArrayPtr>(arr.v);
-        for (int64_t i = from.toInt(); i <= to.toInt(); i++) {
-            items.push_back(Value::makeInt(i));
-        }
-        return arr;
-    }
-
-    if (auto p = dynamic_cast<const BinaryExpr*>(e)) {
-        // 且 / 或 必须短路：右侧表达式可能依赖左侧的判断结果
-        if (p->op == Tok::KW_AND) {
-            if (!eval(p->left.get()).truthy()) return Value::makeBool(false);
-            return Value::makeBool(eval(p->right.get()).truthy());
-        }
-        if (p->op == Tok::KW_OR) {
-            if (eval(p->left.get()).truthy()) return Value::makeBool(true);
-            return Value::makeBool(eval(p->right.get()).truthy());
-        }
-        return applyBinary(p->op, eval(p->left.get()), eval(p->right.get()), e->line);
-    }
-
-    if (auto p = dynamic_cast<const UnaryExpr*>(e)) {
-        Value v = eval(p->operand.get());
-        if (p->op == Tok::KW_NOT) return Value::makeBool(!v.truthy());
-        if (p->op == Tok::MINUS) {
-            if (!v.isNumber()) {
-                throw RuntimeError{"不能对 " + v.typeName() + " 取负", e->line};
+            std::shared_ptr<StructDef> def = it->second;
+            Value inst = Value::makeStruct(def);
+            std::vector<Value>& fields = std::get<StructPtr>(inst.v)->fields;
+            for (const auto& f : p->fields) {
+                int idx = def->indexOf(f.first);
+                if (idx < 0) {
+                    throw RuntimeError{"结构体 " + p->name + " 没有字段 " + f.first,
+                                       e->line};
+                }
+                fields[idx] = eval(f.second.get());
             }
-            return v.isInt() ? Value::makeInt(-v.toInt())
-                             : Value::makeFloat(-v.toDouble());
+            return inst;
         }
-        throw RuntimeError{"不支持的一元运算符", e->line};
-    }
 
-    if (auto p = dynamic_cast<const IndexExpr*>(e)) {
-        Value obj = eval(p->object.get());
-        Value idx = eval(p->index.get());
-        if (!idx.isInt()) throw RuntimeError{"下标必须是整数", e->line};
-        int64_t i = idx.toInt();
+        case ExprKind::Var: {
+            auto p = static_cast<const VarExpr*>(e);
+            // 局部变量：解析期已绑定槽位，这里只剩一次 vector 寻址
+            if (p->slot >= 0) {
+                size_t i = static_cast<size_t>(p->slot);
+                if (i < slots_.size()) return slots_[i];
+                throw RuntimeError{"内部错误：槽位越界", e->line};
+            }
+            // 全局变量：按名字查表
+            auto it = globals_.vars.find(p->name);
+            if (it == globals_.vars.end()) {
+                throw RuntimeError{"未定义的变量「" + p->name + "」", e->line};
+            }
+            return it->second;
+        }
 
-        if (auto arr = std::get_if<ArrayPtr>(&obj.v)) {
-            int64_t n = static_cast<int64_t>((*arr)->size());
-            if (i < 0 || i >= n) {
-                throw RuntimeError{"数组下标越界：" + std::to_string(i) +
-                                   "，长度为 " + std::to_string(n), e->line};
+        case ExprKind::Range: {
+            auto p = static_cast<const RangeExpr*>(e);
+            Value from = eval(p->from.get());
+            Value to = eval(p->to.get());
+            if (!from.isInt() || !to.isInt()) {
+                throw RuntimeError{"范围的两端都必须是整数", e->line};
             }
-            return (**arr)[i];
-        }
-        if (auto s = std::get_if<std::string>(&obj.v)) {
-            int64_t n = static_cast<int64_t>(s->size());
-            if (i < 0 || i >= n) {
-                throw RuntimeError{"字符串下标越界：" + std::to_string(i) +
-                                   "，长度为 " + std::to_string(n), e->line};
+            Value arr = Value::makeArray();
+            std::vector<Value>& items = *std::get<ArrayPtr>(arr.v);
+            for (int64_t i = from.toInt(); i <= to.toInt(); i++) {
+                items.push_back(Value::makeInt(i));
             }
-            return Value::makeStr(std::string(1, (*s)[i]));
+            return arr;
         }
-        throw RuntimeError{obj.typeName() + " 不能用下标访问", e->line};
-    }
 
-    if (auto p = dynamic_cast<const FieldExpr*>(e)) {
-        Value obj = eval(p->object.get());
-        if (auto inst = std::get_if<StructPtr>(&obj.v)) {
-            int idx = (*inst)->def->indexOf(p->field);
-            if (idx < 0) {
-                throw RuntimeError{"结构体 " + (*inst)->def->name +
-                                   " 没有字段 " + p->field, e->line};
+        case ExprKind::Binary: {
+            auto p = static_cast<const BinaryExpr*>(e);
+            // 且 / 或 必须短路：右侧表达式可能依赖左侧的判断结果
+            if (p->op == Tok::KW_AND) {
+                if (!eval(p->left.get()).truthy()) return Value::makeBool(false);
+                return Value::makeBool(eval(p->right.get()).truthy());
             }
-            return (*inst)->fields[idx];
+            if (p->op == Tok::KW_OR) {
+                if (eval(p->left.get()).truthy()) return Value::makeBool(true);
+                return Value::makeBool(eval(p->right.get()).truthy());
+            }
+            return applyBinary(p->op, eval(p->left.get()), eval(p->right.get()),
+                               e->line);
         }
-        if (p->field == "长度") {
+
+        case ExprKind::Unary: {
+            auto p = static_cast<const UnaryExpr*>(e);
+            Value v = eval(p->operand.get());
+            if (p->op == Tok::KW_NOT) return Value::makeBool(!v.truthy());
+            if (p->op == Tok::MINUS) {
+                if (!v.isNumber()) {
+                    throw RuntimeError{"不能对 " + v.typeName() + " 取负", e->line};
+                }
+                return v.isInt() ? Value::makeInt(-v.toInt())
+                                 : Value::makeFloat(-v.toDouble());
+            }
+            throw RuntimeError{"不支持的一元运算符", e->line};
+        }
+
+        case ExprKind::Index: {
+            auto p = static_cast<const IndexExpr*>(e);
+            Value obj = eval(p->object.get());
+            Value idx = eval(p->index.get());
+            if (!idx.isInt()) throw RuntimeError{"下标必须是整数", e->line};
+            int64_t i = idx.toInt();
+
             if (auto arr = std::get_if<ArrayPtr>(&obj.v)) {
-                return Value::makeInt(static_cast<int64_t>((*arr)->size()));
+                int64_t n = static_cast<int64_t>((*arr)->size());
+                if (i < 0 || i >= n) {
+                    throw RuntimeError{"数组下标越界：" + std::to_string(i) +
+                                       "，长度为 " + std::to_string(n), e->line};
+                }
+                return (**arr)[i];
             }
             if (auto s = std::get_if<std::string>(&obj.v)) {
-                return Value::makeInt(static_cast<int64_t>(s->size()));
+                int64_t n = static_cast<int64_t>(s->size());
+                if (i < 0 || i >= n) {
+                    throw RuntimeError{"字符串下标越界：" + std::to_string(i) +
+                                       "，长度为 " + std::to_string(n), e->line};
+                }
+                return Value::makeStr(std::string(1, (*s)[i]));
             }
+            throw RuntimeError{obj.typeName() + " 不能用下标访问", e->line};
         }
-        throw RuntimeError{obj.typeName() + " 没有字段 " + p->field, e->line};
-    }
 
-    if (auto p = dynamic_cast<const CallExpr*>(e)) {
-        auto nameExpr = dynamic_cast<const VarExpr*>(p->callee.get());
-        if (!nameExpr) throw RuntimeError{"只能调用具名函数", e->line};
-
-        std::vector<Value> args;
-        for (const ExprPtr& a : p->args) args.push_back(eval(a.get()));
-
-        // 内置函数优先，其次是用户定义的函数
-        Value result;
-        if (callBuiltin(nameExpr->name, args, result, e->line)) return result;
-
-        auto it = funcs_.find(nameExpr->name);
-        if (it == funcs_.end()) {
-            throw RuntimeError{"未定义的函数「" + nameExpr->name + "」", e->line};
-        }
-        return callFunction(it->second, args, e->line);
-    }
-
-    if (auto p = dynamic_cast<const AssignExpr*>(e)) {
-        Value val = eval(p->value.get());
-        if (p->op != Tok::ASSIGN) {
-            Tok binOp = Tok::PLUS;
-            switch (p->op) {
-                case Tok::PLUS_ASSIGN:  binOp = Tok::PLUS;  break;
-                case Tok::MINUS_ASSIGN: binOp = Tok::MINUS; break;
-                case Tok::STAR_ASSIGN:  binOp = Tok::STAR;  break;
-                case Tok::SLASH_ASSIGN: binOp = Tok::SLASH; break;
-                default: break;
+        case ExprKind::Field: {
+            auto p = static_cast<const FieldExpr*>(e);
+            Value obj = eval(p->object.get());
+            if (auto inst = std::get_if<StructPtr>(&obj.v)) {
+                int idx = (*inst)->def->indexOf(p->field);
+                if (idx < 0) {
+                    throw RuntimeError{"结构体 " + (*inst)->def->name +
+                                       " 没有字段 " + p->field, e->line};
+                }
+                return (*inst)->fields[idx];
             }
-            val = applyBinary(binOp, eval(p->target.get()), val, e->line);
+            if (p->field == "长度") {
+                if (auto arr = std::get_if<ArrayPtr>(&obj.v)) {
+                    return Value::makeInt(static_cast<int64_t>((*arr)->size()));
+                }
+                if (auto s = std::get_if<std::string>(&obj.v)) {
+                    return Value::makeInt(static_cast<int64_t>(s->size()));
+                }
+            }
+            throw RuntimeError{obj.typeName() + " 没有字段 " + p->field, e->line};
         }
-        assignTo(p->target.get(), val, e->line);
-        return val;
-    }
 
-    if (auto p = dynamic_cast<const MethodExpr*>(e)) {
-        Value obj = eval(p->object.get());
-        std::vector<Value> args;
-        for (const ExprPtr& a : p->args) args.push_back(eval(a.get()));
+        case ExprKind::Call: {
+            auto p = static_cast<const CallExpr*>(e);
+            // 被调用者必须是变量名——函数表按名字索引
+            if (p->callee->kind != ExprKind::Var) {
+                throw RuntimeError{"只能调用具名函数", e->line};
+            }
+            const std::string& fname =
+                static_cast<const VarExpr*>(p->callee.get())->name;
 
-        Value result;
-        if (callMethod(obj, p->method, args, result, e->line)) return result;
-        throw RuntimeError{obj.typeName() + " 没有方法 " + p->method, e->line};
+            std::vector<Value> args;
+            for (const ExprPtr& a : p->args) args.push_back(eval(a.get()));
+
+            // 内置函数优先，其次是用户定义的函数
+            Value result;
+            if (callBuiltin(fname, args, result, e->line)) return result;
+
+            auto it = funcs_.find(fname);
+            if (it == funcs_.end()) {
+                throw RuntimeError{"未定义的函数「" + fname + "」", e->line};
+            }
+            return callFunction(it->second, args, e->line);
+        }
+
+        case ExprKind::Method: {
+            auto p = static_cast<const MethodExpr*>(e);
+            Value obj = eval(p->object.get());
+            std::vector<Value> args;
+            for (const ExprPtr& a : p->args) args.push_back(eval(a.get()));
+
+            Value result;
+            if (callMethod(obj, p->method, args, result, e->line)) return result;
+            throw RuntimeError{obj.typeName() + " 没有方法 " + p->method, e->line};
+        }
+
+        case ExprKind::Assign: {
+            auto p = static_cast<const AssignExpr*>(e);
+            Value val = eval(p->value.get());
+            if (p->op != Tok::ASSIGN) {
+                Tok binOp = Tok::PLUS;
+                switch (p->op) {
+                    case Tok::PLUS_ASSIGN:  binOp = Tok::PLUS;  break;
+                    case Tok::MINUS_ASSIGN: binOp = Tok::MINUS; break;
+                    case Tok::STAR_ASSIGN:  binOp = Tok::STAR;  break;
+                    case Tok::SLASH_ASSIGN: binOp = Tok::SLASH; break;
+                    default: break;
+                }
+                val = applyBinary(binOp, eval(p->target.get()), val, e->line);
+            }
+            assignTo(p->target.get(), val, e->line);
+            return val;
+        }
     }
 
     throw RuntimeError{"无法求值的表达式", e->line};

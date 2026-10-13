@@ -1,6 +1,7 @@
 #include "interp.h"
 #include "lexer.h"
 #include "parser.h"
+#include "resolver.h"
 #include <algorithm>
 #include <clocale>
 #include <filesystem>
@@ -212,6 +213,9 @@ static int cmdRepl() {
         std::vector<StmtPtr> stmts = parser.parse();
         if (parser.hadError()) { buffer.clear(); continue; }
 
+        Resolver resolver;
+        resolver.resolve(stmts);
+
         Value out;
         bool hasOut = false;
         interp.runRepl(std::move(stmts), out, hasOut);
@@ -233,6 +237,10 @@ static bool runSource(Interpreter& interp, const std::string& src,
     Parser parser(std::move(tokens), name);
     std::vector<StmtPtr> stmts = parser.parse();
     if (parser.hadError()) return false;
+
+    // 执行前先做槽位绑定
+    Resolver resolver;
+    resolver.resolve(stmts);
 
     return interp.run(std::move(stmts));
 }
@@ -403,6 +411,10 @@ static int cmdRun(const std::string& path) {
     Parser parser(std::move(tokens), path);
     std::vector<StmtPtr> stmts = parser.parse();
     if (parser.hadError()) return 1;
+
+    // 执行前先做槽位绑定：把局部变量解析成下标，避免运行期哈希查找
+    Resolver resolver;
+    resolver.resolve(stmts);
 
     Interpreter interp;
     return interp.run(std::move(stmts)) ? 0 : 1;

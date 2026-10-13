@@ -7,7 +7,12 @@ Flow Interpreter::exec(const Stmt* s) {
 
     if (auto p = dynamic_cast<const VarDecl*>(s)) {
         Value v = p->init ? eval(p->init.get()) : Value{};
-        env_->define(p->name, std::move(v), p->isConst);
+        if (p->slot >= 0) {
+            slots_[p->slot] = std::move(v);   // 局部变量：按槽位存
+        } else {
+            globals_.vars[p->name] = std::move(v);
+            if (p->isConst) globals_.consts[p->name] = true;
+        }
         return Flow::Normal;
     }
 
@@ -29,21 +34,14 @@ Flow Interpreter::exec(const Stmt* s) {
         return Flow::Normal;
     }
 
-    // 块语句自建一层作用域，离开时销毁——这就是块级作用域的实现
+    // 块级作用域在解析期就由 Resolver 处理好了——块内声明的变量分到
+    // 独立槽位，离开块后不再被引用。运行期顺序执行即可。
     if (auto p = dynamic_cast<const BlockStmt*>(s)) {
-        Env scope;
-        scope.parent = env_;
-        Env* saved = env_;
-        env_ = &scope;
-
-        Flow flow = Flow::Normal;
         for (const StmtPtr& st : p->stmts) {
-            flow = exec(st.get());
-            if (flow != Flow::Normal) break;
+            Flow flow = exec(st.get());
+            if (flow != Flow::Normal) return flow;
         }
-
-        env_ = saved;
-        return flow;
+        return Flow::Normal;
     }
 
     if (auto p = dynamic_cast<const IfStmt*>(s)) {
@@ -77,7 +75,8 @@ Flow Interpreter::exec(const Stmt* s) {
         }
 
         for (const Value& item : items) {
-            env_->vars[p->var] = item;
+            if (p->varSlot >= 0) slots_[p->varSlot] = item;
+            else                 globals_.vars[p->var] = item;
             Flow flow = exec(p->body.get());
             if (flow == Flow::Break) break;
             if (flow == Flow::Return) return flow;
@@ -123,17 +122,18 @@ Value Interpreter::callFunction(const FuncDecl* fn, std::vector<Value>& args,
     }
     callDepth_++;
 
-    // 函数的父环境是全局，不是调用点——所以函数看不见调用者的局部变量。
+    // 开一个新帧：参数依次占槽位 0..N-1，其余槽位留给函数内的局部变量。
+    // 旧帧先挪到一边，返回时再换回来——递归因此天然正确。
+    //
+    // 帧里只有函数自己的参数与局部变量，看不见调用者的任何东西，
     // 这是「不做闭包」这个设计决定的直接体现。
-    Env frame;
-    frame.parent = &globals_;
+    std::vector<Value> savedSlots = std::move(slots_);
+    slots_.assign(static_cast<size_t>(fn->slotCount), Value{});
     for (size_t i = 0; i < fn->params.size(); i++) {
-        frame.vars[fn->params[i]] = args[i];
+        slots_[i] = args[i];
     }
 
-    Env* savedEnv = env_;
     Value savedReturn = returnValue_;
-    env_ = &frame;
     returnValue_ = Value{};
 
     Flow flow = exec(fn->body.get());
@@ -142,23 +142,28 @@ Value Interpreter::callFunction(const FuncDecl* fn, std::vector<Value>& args,
     Value result = (flow == Flow::Return) ? returnValue_ : Value{};
 
     returnValue_ = savedReturn;
-    env_ = savedEnv;
+    slots_ = std::move(savedSlots);
     callDepth_--;
     return result;
 }
 
 void Interpreter::assignTo(const Expr* target, const Value& value, int line) {
     if (auto v = dynamic_cast<const VarExpr*>(target)) {
-        for (Env* e = env_; e; e = e->parent) {
-            auto it = e->vars.find(v->name);
-            if (it == e->vars.end()) continue;
-            if (e->consts.count(v->name)) {
-                throw RuntimeError{"不能给常量「" + v->name + "」重新赋值", line};
-            }
-            it->second = value;
+        // 局部变量：解析期已绑定槽位，且局部不会有常量（常量只在顶层有意义）
+        if (v->slot >= 0 && static_cast<size_t>(v->slot) < slots_.size()) {
+            slots_[v->slot] = value;
             return;
         }
-        throw RuntimeError{"未定义的变量「" + v->name + "」", line};
+
+        auto it = globals_.vars.find(v->name);
+        if (it == globals_.vars.end()) {
+            throw RuntimeError{"未定义的变量「" + v->name + "」", line};
+        }
+        if (globals_.isConst(v->name)) {
+            throw RuntimeError{"不能给常量「" + v->name + "」重新赋值", line};
+        }
+        it->second = value;
+        return;
     }
 
     if (auto ix = dynamic_cast<const IndexExpr*>(target)) {
