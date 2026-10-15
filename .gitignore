@@ -29,7 +29,7 @@ bench/*.tmp
 # 开发计划与设计过程文档
 docs/superpowers/
 Willen语言项目执行计划书.docx
-tools/
+tools/md2docx.py
 
 # 开发辅助工作区
 .superpowers/
