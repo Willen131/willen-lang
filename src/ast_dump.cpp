@@ -61,7 +61,7 @@ std::string dumpExpr(const Expr* e) {
     }
     if (auto p = dynamic_cast<const StrLit*>(e))   return quote(p->value);
     if (auto p = dynamic_cast<const BoolLit*>(e))  return p->value ? "真" : "假";
-    if (auto p = dynamic_cast<const NullLit*>(e))  return "空";
+    if (dynamic_cast<const NullLit*>(e))           return "空";
 
     if (auto p = dynamic_cast<const TmplLit*>(e)) {
         std::string out = "(Tmpl";
